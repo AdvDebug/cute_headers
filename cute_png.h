@@ -23,7 +23,7 @@
 		1.02 (10/23/2017) support for explicitly loading paletted png images
 		1.03 (11/12/2017) construct atlas in memory
 		1.04 (08/23/2018) various bug fixes for filter and word decoder
-		                  added `cp_load_blank`
+						  added `cp_load_blank`
 		1.05 (11/10/2022) added `cp_save_png_to_memory`
 
 
@@ -104,24 +104,185 @@
 		Dennis Korpel     1.04 - fix for filter on first row of pixels
 */
 
+
+//============================== allocator for better memory safety ====================================
+static inline void yield(int attempt) {
+#if defined(_WIN32)
+	Sleep(1);
+#elif defined(__unix__) || defined(__APPLE__)
+	sched_yield();
+#else
+	for (volatile int i = 0; i < (1 << (attempt < 10 ? attempt : 10)); ++i) {}
+#endif
+}
+static volatile int allocs_lock = 0;
+
+static void allocs_lock_acquire() {
+	int attempt = 0;
+	while (1) {
+		if (allocs_lock == 0) {
+			allocs_lock = 1;
+			volatile int tmp = allocs_lock;
+			(void)tmp;
+			return;
+		}
+		yield(attempt++);
+	}
+}
+
+static void allocs_lock_release(void) {
+	allocs_lock = 0;
+}
+
+typedef struct {
+	void* ptr;
+	size_t size;
+	const char* tag;
+} alloc_t;
+
+static alloc_t* allocs = NULL;
+
+static size_t alloc_count = 0;
+static size_t alloc_capacity = 0;
+
+static void alloc_track(void* ptr, size_t size, const char* tag) {
+	if (!ptr) return;
+	allocs_lock_acquire();
+	if (alloc_count == alloc_capacity) {
+		size_t new_capacity;
+		if (alloc_capacity == 0) {
+			new_capacity = 128;
+		}
+		else if (alloc_capacity > SIZE_MAX / 2 / sizeof(alloc_t)) {
+			allocs_lock_release();
+			abort();
+		}
+		else {
+			new_capacity = alloc_capacity * 2;
+		}
+		alloc_t* new_allocs = (alloc_t*)realloc(allocs, new_capacity * sizeof(alloc_t));
+		if (!new_allocs) {
+			allocs_lock_release();
+			abort();
+		}
+		allocs = new_allocs;
+		alloc_capacity = new_capacity;
+	}
+	alloc_t tmp;
+	tmp.ptr = ptr;
+	tmp.size = size;
+	tmp.tag = tag;
+	allocs[alloc_count++] = tmp;
+	allocs_lock_release();
+}
+
+static void alloc_untrack(void* ptr) {
+	allocs_lock_acquire();
+	for (size_t i = 0; i < alloc_count; ++i) {
+		if (allocs[i].ptr == ptr) {
+			allocs[i] = allocs[--alloc_count];
+			allocs_lock_release();
+			return;
+		}
+	}
+	allocs_lock_release();
+	abort();
+}
+
+static size_t alloc_size(void* ptr) {
+	uint8_t* d = (uint8_t*)ptr;
+	allocs_lock_acquire();
+	for (size_t i = 0; i < alloc_count; ++i) {
+		uint8_t* base = (uint8_t*)allocs[i].ptr;
+		size_t size = allocs[i].size;
+		if (d >= base && d < base + size)
+		{
+			allocs_lock_release();
+			return size - (size_t)(d - base);
+		}
+	}
+	allocs_lock_release();
+	return 0;
+}
+
+void* alloc(size_t size) {
+	void* p = malloc(size);
+	if (p) alloc_track(p, size, "malloc");
+	return p;
+}
+
+void* calloc_(size_t n, size_t size) {
+	void* p = calloc(n, size);
+	if (p) alloc_track(p, n * size, "calloc");
+	return p;
+}
+
+void* realloc_(void* ptr, size_t size) {
+	if (!ptr) return alloc(size);
+
+	allocs_lock_acquire();
+	size_t idx = (size_t)-1;
+	for (size_t i = 0; i < alloc_count; ++i) {
+		if (allocs[i].ptr == ptr) { idx = i; break; }
+	}
+	if (idx == (size_t)-1) {
+		allocs_lock_release();
+		abort();
+	}
+	void* newp = realloc(ptr, size);
+	if (!newp) {
+		allocs_lock_release();
+		return NULL;
+	}
+	allocs[idx].ptr = newp;
+	allocs[idx].size = size;
+	allocs[idx].tag = "realloc";
+	allocs_lock_release();
+	return newp;
+}
+
+void free_(void* ptr) {
+	alloc_untrack(ptr);
+	free(ptr);
+}
+
+void* memcpy_(void* dest, const void* src, size_t n) {
+	size_t size = alloc_size(dest);
+	if (size && n > size)
+	{
+		abort();
+	}
+	return memcpy(dest, src, n);
+}
+
+void* memset_(void* dest, int value, size_t n) {
+	size_t size = alloc_size(dest);
+	if (size && n > size)
+	{
+		abort();
+	}
+	return memset(dest, value, n);
+}
+//===============================================================================================================
+
 #if !defined(CUTE_PNG_H)
 
 #ifdef _WIN32
-	#if !defined(_CRT_SECURE_NO_WARNINGS)
-		#define _CRT_SECURE_NO_WARNINGS
-	#endif
+#if !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #endif
 
 #ifndef CUTE_PNG_ATLAS_MUST_FIT
-	#define CUTE_PNG_ATLAS_MUST_FIT            1 // returns error from cp_make_atlas if *any* input image does not fit
+#define CUTE_PNG_ATLAS_MUST_FIT            1 // returns error from cp_make_atlas if *any* input image does not fit
 #endif // CUTE_PNG_ATLAS_MUST_FIT
 
 #ifndef CUTE_PNG_ATLAS_FLIP_Y_AXIS_FOR_UV
-	#define CUTE_PNG_ATLAS_FLIP_Y_AXIS_FOR_UV  1 // flips output uv coordinate's y. Can be useful to "flip image on load"
+#define CUTE_PNG_ATLAS_FLIP_Y_AXIS_FOR_UV  1 // flips output uv coordinate's y. Can be useful to "flip image on load"
 #endif // CUTE_PNG_ATLAS_FLIP_Y_AXIS_FOR_UV
 
 #ifndef CUTE_PNG_ATLAS_EMPTY_COLOR
-	#define CUTE_PNG_ATLAS_EMPTY_COLOR         0x000000FF // the fill color for empty areas in a texture atlas (RGBA)
+#define CUTE_PNG_ATLAS_EMPTY_COLOR         0x000000FF // the fill color for empty areas in a texture atlas (RGBA)
 #endif // CUTE_PNG_ATLAS_EMPTY_COLOR
 
 #include <stdint.h>
@@ -143,8 +304,8 @@ typedef struct cp_saved_png_t
 {
 	int size;   // Size of the `data` buffer.
 	void* data; // Pointer to the saved png in memory.
-	            // NULL if something went wrong.
-	            // Call CUTE_PNG_FREE on `data` when done.
+	// NULL if something went wrong.
+	// Call CUTE_PNG_FREE on `data` when done.
 } cp_saved_png_t;
 
 // Saves a png file to memory.
@@ -163,8 +324,8 @@ int cp_default_save_atlas(const char* out_path_image, const char* out_path_atlas
 
 // these two functions return cp_image_t::pix as 0 in event of errors
 // call free on cp_image_t::pix when done, or call cp_free_png
-cp_image_t cp_load_png(const char *file_name);
-cp_image_t cp_load_png_mem(const void *png_data, int png_length);
+cp_image_t cp_load_png(const char* file_name);
+cp_image_t cp_load_png_mem(const void* png_data, int png_length);
 cp_image_t cp_load_blank(int w, int h); // Alloc's pixels, but `pix` memory is uninitialized.
 void cp_free_png(cp_image_t* img);
 void cp_flip_image_horizontal(cp_image_t* img);
@@ -176,7 +337,7 @@ void cp_load_png_wh(const void* png_data, int png_length, int* w, int* h);
 // these two functions return cp_indexed_image_t::pix as 0 in event of errors
 // call free on cp_indexed_image_t::pix when done, or call cp_free_indexed_png
 cp_indexed_image_t cp_load_indexed_png(const char* file_name);
-cp_indexed_image_t cp_load_indexed_png_mem(const void *png_data, int png_length);
+cp_indexed_image_t cp_load_indexed_png_mem(const void* png_data, int png_length);
 void cp_free_indexed_png(cp_indexed_image_t* img);
 
 // converts paletted image into a standard RGBA image
@@ -228,108 +389,108 @@ struct cp_atlas_image_t
 #define CUTE_PNG_IMPLEMENTATION_ONCE
 
 #if !defined(CUTE_PNG_ALLOCA)
-	#define CUTE_PNG_ALLOCA alloca
+#define CUTE_PNG_ALLOCA alloca
 
-	#ifdef _WIN32
-		#include <malloc.h>
-	#elif defined(__linux__)
-		#include <alloca.h>
-	#endif
+#ifdef _WIN32
+#include <malloc.h>
+#elif defined(__linux__)
+#include <alloca.h>
+#endif
 #endif
 
 #if !defined(CUTE_PNG_ALLOC)
-	#include <stdlib.h>
-	#define CUTE_PNG_ALLOC malloc
+#include <stdlib.h>
+#define CUTE_PNG_ALLOC alloc
 #endif
 
 #if !defined(CUTE_PNG_FREE)
-	#include <stdlib.h>
-	#define CUTE_PNG_FREE free
+#include <stdlib.h>
+#define CUTE_PNG_FREE free_
 #endif
 
 #if !defined(CUTE_PNG_CALLOC)
-	#include <stdlib.h>
-	#define CUTE_PNG_CALLOC calloc
+#include <stdlib.h>
+#define CUTE_PNG_CALLOC calloc_
 #endif
 
 #if !defined(CUTE_PNG_REALLOC)
-	#include <stdlib.h>
-	#define CUTE_PNG_REALLOC realloc
+#include <stdlib.h>
+#define CUTE_PNG_REALLOC realloc_
 #endif
 
 #if !defined(CUTE_PNG_MEMCPY)
-	#include <string.h>
-	#define CUTE_PNG_MEMCPY memcpy
+#include <string.h>
+#define CUTE_PNG_MEMCPY memcpy_
 #endif
 
 #if !defined(CUTE_PNG_MEMCMP)
-	#include <string.h>
-	#define CUTE_PNG_MEMCMP memcmp
+#include <string.h>
+#define CUTE_PNG_MEMCMP memcmp
 #endif
 
 #if !defined(CUTE_PNG_MEMSET)
-	#include <string.h>
-	#define CUTE_PNG_MEMSET memset
+#include <string.h>
+#define CUTE_PNG_MEMSET memset_
 #endif
 
 #if !defined(CUTE_PNG_ASSERT)
-	#include <assert.h>
-	#define CUTE_PNG_ASSERT assert
+#include <assert.h>
+#define CUTE_PNG_ASSERT assert
 #endif
 
 #if !defined(CUTE_PNG_FPRINTF)
-	#include <stdio.h>
-	#define CUTE_PNG_FPRINTF fprintf
+#include <stdio.h>
+#define CUTE_PNG_FPRINTF fprintf
 #endif
 
 #if !defined(CUTE_PNG_SEEK_SET)
-	#include <stdio.h>
-	#define CUTE_PNG_SEEK_SET SEEK_SET
+#include <stdio.h>
+#define CUTE_PNG_SEEK_SET SEEK_SET
 #endif
 
 #if !defined(CUTE_PNG_SEEK_END)
-	#include <stdio.h>
-	#define CUTE_PNG_SEEK_END SEEK_END
+#include <stdio.h>
+#define CUTE_PNG_SEEK_END SEEK_END
 #endif
 
 #if !defined(CUTE_PNG_FILE)
-	#include <stdio.h>
-	#define CUTE_PNG_FILE FILE
+#include <stdio.h>
+#define CUTE_PNG_FILE FILE
 #endif
 
 #if !defined(CUTE_PNG_FOPEN)
-	#include <stdio.h>
-	#define CUTE_PNG_FOPEN fopen
+#include <stdio.h>
+#define CUTE_PNG_FOPEN fopen
 #endif
 
 #if !defined(CUTE_PNG_FSEEK)
-	#include <stdio.h>
-	#define CUTE_PNG_FSEEK fseek
+#include <stdio.h>
+#define CUTE_PNG_FSEEK fseek
 #endif
 
 #if !defined(CUTE_PNG_FREAD)
-	#include <stdio.h>
-	#define CUTE_PNG_FREAD fread
+#include <stdio.h>
+#define CUTE_PNG_FREAD fread
 #endif
 
 #if !defined(CUTE_PNG_FTELL)
-	#include <stdio.h>
-	#define CUTE_PNG_FTELL ftell
+#include <stdio.h>
+#define CUTE_PNG_FTELL ftell
 #endif
 
 #if !defined(CUTE_PNG_FWRITE)
-	#include <stdio.h>
-	#define CUTE_PNG_FWRITE fwrite
+#include <stdio.h>
+#define CUTE_PNG_FWRITE fwrite
 #endif
 
 #if !defined(CUTE_PNG_FCLOSE)
-	#include <stdio.h>
-	#define CUTE_PNG_FCLOSE fclose
+#include <stdio.h>
+#define CUTE_PNG_FCLOSE fclose
 #endif
 
 #if !defined(CUTE_PNG_FERROR)
-	#include <stdio.h>
-	#define CUTE_PNG_FERROR ferror
+#include <stdio.h>
+#define CUTE_PNG_FERROR ferror
 #endif
 
 static cp_pixel_t cp_make_pixel_a(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
@@ -354,6 +515,8 @@ const char* cp_error_reason;
 #define CUTE_PNG_LOOKUP_COUNT (1 << CUTE_PNG_LOOKUP_BITS)
 #define CUTE_PNG_LOOKUP_MASK (CUTE_PNG_LOOKUP_COUNT - 1)
 #define CUTE_PNG_DEFLATE_MAX_BITLEN 15
+#define CUTE_PNG_MAX_WIDTH  8192
+#define CUTE_PNG_MAX_HEIGHT 8192
 
 // DEFLATE tables from RFC 1951
 uint8_t cp_fixed_table[288 + 32] = {
@@ -463,6 +626,8 @@ static char* cp_read_file_to_memory(const char* path, int* size)
 		sizeNum = CUTE_PNG_FTELL(fp);
 		CUTE_PNG_FSEEK(fp, 0, CUTE_PNG_SEEK_SET);
 		data = (char*)CUTE_PNG_ALLOC(sizeNum + 1);
+		if (!data)
+			return NULL;
 		CUTE_PNG_FREAD(data, sizeNum, 1, fp);
 		data[sizeNum] = 0;
 		CUTE_PNG_FCLOSE(fp);
@@ -474,10 +639,10 @@ static char* cp_read_file_to_memory(const char* path, int* size)
 
 static uint32_t cp_rev16(uint32_t a)
 {
-	a = ((a & 0xAAAA) >>  1) | ((a & 0x5555) << 1);
-	a = ((a & 0xCCCC) >>  2) | ((a & 0x3333) << 2);
-	a = ((a & 0xF0F0) >>  4) | ((a & 0x0F0F) << 4);
-	a = ((a & 0xFF00) >>  8) | ((a & 0x00FF) << 8);
+	a = ((a & 0xAAAA) >> 1) | ((a & 0x5555) << 1);
+	a = ((a & 0xCCCC) >> 2) | ((a & 0x3333) << 2);
+	a = ((a & 0xF0F0) >> 4) | ((a & 0x0F0F) << 4);
+	a = ((a & 0xFF00) >> 8) | ((a & 0x00FF) << 8);
 	return a;
 }
 
@@ -540,6 +705,7 @@ static int cp_stored(cp_state_t* s)
 	CUTE_PNG_CHECK(LEN == (uint16_t)(~NLEN), "Failed to find LEN and NLEN as complements within stored (uncompressed) stream.");
 	CUTE_PNG_CHECK(s->bits_left / 8 <= (int)LEN, "Stored block extends beyond end of input stream.");
 	p = cp_ptr(s);
+	CUTE_PNG_CHECK((s->out_end - s->out) >= LEN, "Output buffer too small for uncompressed data.");
 	CUTE_PNG_MEMCPY(s->out, p, LEN);
 	s->out += LEN;
 	return 1;
@@ -577,7 +743,7 @@ static int cp_decode(cp_state_t* s, uint32_t* tree, int hi)
 	return (key >> 4) & 0xFFF;
 }
 
-#define MAX_LEN 384
+#define MAX_LEN 316
 
 // 3.2.7
 static int cp_dynamic(cp_state_t* s)
@@ -661,6 +827,7 @@ static int cp_block(cp_state_t* s)
 			symbol -= 257;
 			int length = cp_read_bits(s, cp_len_extra_bits[symbol]) + cp_len_base[symbol];
 			int distance_symbol = cp_decode(s, s->dst, s->ndst);
+			CUTE_PNG_CHECK(distance_symbol >= 0 && distance_symbol < (sizeof(cp_dist_base) / sizeof(cp_dist_base[0])), "Invalid distance symbol.");
 			int backwards_distance = cp_read_bits(s, cp_dist_extra_bits[distance_symbol]) + cp_dist_base[distance_symbol];
 			CUTE_PNG_CHECK(s->out - backwards_distance >= s->begin, "Attempted to write before out buffer (invalid backwards distance).");
 			CUTE_PNG_CHECK(s->out + length <= s->out_end, "Attempted to overwrite out buffer while outputting a string.");
@@ -690,13 +857,15 @@ cp_err:
 int cp_inflate(void* in, int in_bytes, void* out, int out_bytes)
 {
 	cp_state_t* s = (cp_state_t*)CUTE_PNG_CALLOC(1, sizeof(cp_state_t));
+	if (!s)
+		return 0;
 	s->bits = 0;
 	s->count = 0;
 	s->word_index = 0;
 	s->bits_left = in_bytes * 8;
 
 	// s->words is the in-pointer rounded up to a multiple of 4
-	int first_bytes = (int) ((( (size_t) in + 3) & ~3) - (size_t) in);
+	int first_bytes = (int)((((size_t)in + 3) & ~3) - (size_t)in);
 	s->words = (uint32_t*)((char*)in + first_bytes);
 	s->word_count = (in_bytes - first_bytes) / 4;
 	int last_bytes = ((in_bytes - first_bytes) & 3);
@@ -706,8 +875,8 @@ int cp_inflate(void* in, int in_bytes, void* out, int out_bytes)
 
 	s->final_word_available = last_bytes ? 1 : 0;
 	s->final_word = 0;
-	for(int i = 0; i < last_bytes; i++) 
-		s->final_word |= ((uint8_t*)in)[in_bytes - last_bytes+i] << (i * 8);
+	for (int i = 0; i < last_bytes; i++)
+		s->final_word |= ((uint8_t*)in)[in_bytes - last_bytes + i] << (i * 8);
 
 	s->count = first_bytes * 8;
 
@@ -731,8 +900,7 @@ int cp_inflate(void* in, int in_bytes, void* out, int out_bytes)
 		}
 
 		++count;
-	}
-	while (!bfinal);
+	} while (!bfinal);
 
 	CUTE_PNG_FREE(s);
 	return 1;
@@ -833,7 +1001,7 @@ static void cp_encode_literal(cp_save_png_data_t* s, uint32_t v)
 {
 	// Encode a literal/length using the built-in tables.
 	// Could do better with a custom table but whatever.
-	     if (v < 144) cp_put_bitsr(s, 0x030 + v -   0, 8);
+	if (v < 144) cp_put_bitsr(s, 0x030 + v - 0, 8);
 	else if (v < 256) cp_put_bitsr(s, 0x190 + v - 144, 9);
 	else if (v < 280) cp_put_bitsr(s, 0x000 + v - 256, 7);
 	else              cp_put_bitsr(s, 0x0c0 + v - 280, 8);
@@ -859,7 +1027,7 @@ static void cp_end_run(cp_save_png_data_t* s)
 	else while (s->runlen--) cp_encode_literal(s, s->prev);
 }
 
-static void cp_encode_byte(cp_save_png_data_t *s, uint8_t v)
+static void cp_encode_byte(cp_save_png_data_t* s, uint8_t v)
 {
 	cp_update_adler(s, v);
 
@@ -902,7 +1070,7 @@ static void cp_save_data(cp_save_png_data_t* s, cp_image_t* img, long dataPos, l
 
 	for (int y = 0; y < img->h; ++y)
 	{
-		cp_pixel_t *row = &img->pix[y * img->w];
+		cp_pixel_t* row = &img->pix[y * img->w];
 		cp_pixel_t prev = cp_make_pixel_a(0, 0, 0, 0);
 
 		cp_encode_byte(s, 1); // sub filter
@@ -936,7 +1104,8 @@ cp_saved_png_t cp_save_png_to_memory(const cp_image_t* img)
 	s.prev = 0xFFFF;
 	s.bufcap = 1024;
 	s.buffer = (char*)CUTE_PNG_ALLOC(1024);
-
+	if (!s.buffer)
+		return result;
 	cp_save_header(&s, (cp_image_t*)img);
 	dataPos = s.buflen;
 	cp_save_data(&s, (cp_image_t*)img, dataPos, &dataSize);
@@ -982,33 +1151,37 @@ static uint32_t cp_make32(const uint8_t* s)
 
 static const uint8_t* cp_chunk(cp_raw_png_t* png, const char* chunk, uint32_t minlen)
 {
-	uint32_t len = cp_make32(png->p);
-	const uint8_t* start = png->p;
+	if (png == NULL || png->end == 0 || png->p == 0)
+		return 0;
+	// make sure that there are at least 4 bytes remaining in the buffer
+	if (png->end - png->p >= 4) {
+		uint32_t len = cp_make32(png->p);
+		const uint8_t* start = png->p;
 
-	if (!CUTE_PNG_MEMCMP(start + 4, chunk, 4) && len >= minlen)
-	{
-		int offset = len + 12;
-
-		if (png->p + offset <= png->end)
+		if (!CUTE_PNG_MEMCMP(start + 4, chunk, 4) && len >= minlen)
 		{
-			png->p += offset;
-			return start + 8;
+			int offset = len + 12;
+
+			if (png->p + offset <= png->end)
+			{
+				png->p += offset;
+				return start + 8;
+			}
 		}
 	}
-
 	return 0;
 }
 
 static const uint8_t* cp_find(cp_raw_png_t* png, const char* chunk, uint32_t minlen)
 {
-	const uint8_t *start;
+	const uint8_t* start;
 	while (png->p < png->end)
 	{
 		uint32_t len = cp_make32(png->p);
 		start = png->p;
 		png->p += len + 12;
 
-		if (!CUTE_PNG_MEMCMP(start+4, chunk, 4) && len >= minlen && png->p <= png->end)
+		if (!CUTE_PNG_MEMCMP(start + 4, chunk, 4) && len >= minlen && png->p <= png->end)
 			return start + 8;
 	}
 
@@ -1018,7 +1191,7 @@ static const uint8_t* cp_find(cp_raw_png_t* png, const char* chunk, uint32_t min
 static int cp_unfilter(int w, int h, int bpp, uint8_t* raw)
 {
 	int len = w * bpp;
-	uint8_t *prev;
+	uint8_t* prev;
 	int x;
 
 	if (h > 0)
@@ -1045,10 +1218,10 @@ static int cp_unfilter(int w, int h, int bpp, uint8_t* raw)
 		switch (*raw++)
 		{
 		case 0: break;
-		case 1: FILTER_LOOP(0          , raw[x - bpp] );
-		case 2: FILTER_LOOP(prev[x]    , prev[x]);
+		case 1: FILTER_LOOP(0, raw[x - bpp]);
+		case 2: FILTER_LOOP(prev[x], prev[x]);
 		case 3: FILTER_LOOP(prev[x] / 2, (raw[x - bpp] + prev[x]) / 2);
-		case 4: FILTER_LOOP(prev[x]    , cp_paeth(raw[x - bpp], prev[x], prev[x -bpp]));
+		case 4: FILTER_LOOP(prev[x], cp_paeth(raw[x - bpp], prev[x], prev[x - bpp]));
 		default: return 0;
 		}
 #undef FILTER_LOOP
@@ -1068,10 +1241,10 @@ static void cp_convert(int bpp, int w, int h, uint8_t* src, cp_pixel_t* dst)
 		{
 			switch (bpp)
 			{
-				case 1: *dst++ = cp_make_pixel(src[0], src[0], src[0]); break;
-				case 2: *dst++ = cp_make_pixel_a(src[0], src[0], src[0], src[1]); break;
-				case 3: *dst++ = cp_make_pixel(src[0], src[1], src[2]); break;
-				case 4: *dst++ = cp_make_pixel_a(src[0], src[1], src[2], src[3]); break;
+			case 1: *dst++ = cp_make_pixel(src[0], src[0], src[0]); break;
+			case 2: *dst++ = cp_make_pixel_a(src[0], src[0], src[0], src[1]); break;
+			case 3: *dst++ = cp_make_pixel(src[0], src[1], src[2]); break;
+			case 4: *dst++ = cp_make_pixel_a(src[0], src[1], src[2], src[3]); break;
 			}
 		}
 	}
@@ -1117,7 +1290,7 @@ static int cp_out_size(cp_image_t* img, int bpp)
 cp_image_t cp_load_png_mem(const void* png_data, int png_length)
 {
 	const char* sig = "\211PNG\r\n\032\n";
-	const uint8_t* ihdr, *first, *plte, *trns;
+	const uint8_t* ihdr, * first, * plte, * trns;
 	int bit_depth, color_type, bpp, w, h, pix_bytes;
 	int compression, filter, interlace;
 	int datalen, offset;
@@ -1128,6 +1301,7 @@ cp_image_t cp_load_png_mem(const void* png_data, int png_length)
 	png.p = (uint8_t*)png_data;
 	png.end = (uint8_t*)png_data + png_length;
 
+	CUTE_PNG_CHECK(png.end - png.p >= 8, "file too short for PNG signature");
 	CUTE_PNG_CHECK(!CUTE_PNG_MEMCMP(png.p, sig, 8), "incorrect file signature (is this a png file?)");
 	png.p += 8;
 
@@ -1139,12 +1313,12 @@ cp_image_t cp_load_png_mem(const void* png_data, int png_length)
 
 	switch (color_type)
 	{
-		case 0: bpp = 1; break; // greyscale
-		case 2: bpp = 3; break; // RGB
-		case 3: bpp = 1; break; // paletted
-		case 4: bpp = 2; break; // grey+alpha
-		case 6: bpp = 4; break; // RGBA
-		default: CUTE_PNG_CHECK(0, "unknown color type");
+	case 0: bpp = 1; break; // greyscale
+	case 2: bpp = 3; break; // RGB
+	case 3: bpp = 1; break; // paletted
+	case 4: bpp = 2; break; // grey+alpha
+	case 6: bpp = 4; break; // RGBA
+	default: CUTE_PNG_CHECK(0, "unknown color type");
 	}
 
 	// +1 for filter byte (which is dumb! just stick this at file header...)
@@ -1152,7 +1326,9 @@ cp_image_t cp_load_png_mem(const void* png_data, int png_length)
 	h = cp_make32(ihdr + 4);
 	CUTE_PNG_CHECK(w >= 1, "invalid IHDR chunk found, image width was less than 1");
 	CUTE_PNG_CHECK(h >= 1, "invalid IHDR chunk found, image height was less than 1");
-        CUTE_PNG_CHECK((int64_t) w * h * sizeof(cp_pixel_t) < INT_MAX, "image too large");
+	CUTE_PNG_CHECK(w <= CUTE_PNG_MAX_WIDTH, "image too wide");
+	CUTE_PNG_CHECK(h <= CUTE_PNG_MAX_HEIGHT, "image too tall");
+	CUTE_PNG_CHECK((int64_t)w * h * sizeof(cp_pixel_t) < INT_MAX, "image too large");
 	pix_bytes = w * h * sizeof(cp_pixel_t);
 	img.w = w - 1;
 	img.h = h;
@@ -1188,6 +1364,7 @@ cp_image_t cp_load_png_mem(const void* png_data, int png_length)
 	// Copy in IDAT chunk data sections to form the compressed DEFLATE stream
 	png.p = first;
 	data = (uint8_t*)CUTE_PNG_ALLOC(datalen);
+	CUTE_PNG_CHECK(data, "out of memory");
 	offset = 0;
 	for (const uint8_t* idat = cp_find(&png, "IDAT", 0); idat; idat = cp_chunk(&png, "IDAT", 0))
 	{
@@ -1208,6 +1385,7 @@ cp_image_t cp_load_png_mem(const void* png_data, int png_length)
 
 	out = (uint8_t*)img.pix + cp_out_size(&img, 4) - cp_out_size(&img, bpp);
 	CUTE_PNG_CHECK(cp_inflate(data + 2, datalen - 6, out, ((uint8_t*)img.pix + pix_bytes) - out), "DEFLATE algorithm failed");
+
 	CUTE_PNG_CHECK(cp_unfilter(img.w, img.h, bpp, out), "invalid filter byte found");
 
 	if (color_type == 3)
@@ -1238,11 +1416,13 @@ cp_image_t cp_load_blank(int w, int h)
 	return img;
 }
 
-cp_image_t cp_load_png(const char *file_name)
+cp_image_t cp_load_png(const char* file_name)
 {
 	cp_image_t img = { 0 };
 	int len;
 	void* data = cp_read_file_to_memory(file_name, &len);
+	if (!data)
+		return img;
 	if (!data) return img;
 	img = cp_load_png_mem(data, len);
 	CUTE_PNG_FREE(data);
@@ -1289,6 +1469,7 @@ void cp_load_png_wh(const void* png_data, int png_length, int* w_out, int* h_out
 	if (w_out) *w_out = 0;
 	if (h_out) *h_out = 0;
 
+	CUTE_PNG_CHECK(png.end - png.p >= 8, "file too short for PNG signature");
 	CUTE_PNG_CHECK(!CUTE_PNG_MEMCMP(png.p, sig, 8), "incorrect file signature (is this a png file?)");
 	png.p += 8;
 
@@ -1301,7 +1482,7 @@ void cp_load_png_wh(const void* png_data, int png_length, int* w_out, int* h_out
 	if (w_out) *w_out = w - 1;
 	if (h_out) *h_out = h;
 
-	cp_err:;
+cp_err:;
 }
 
 cp_indexed_image_t cp_load_indexed_png(const char* file_name)
@@ -1342,10 +1523,10 @@ void cp_unpack_palette(cp_pixel_t* dst, const uint8_t* plte, int plte_len, const
 	}
 }
 
-cp_indexed_image_t cp_load_indexed_png_mem(const void *png_data, int png_length)
+cp_indexed_image_t cp_load_indexed_png_mem(const void* png_data, int png_length)
 {
 	const char* sig = "\211PNG\r\n\032\n";
-	const uint8_t* ihdr, *first, *plte, *trns;
+	const uint8_t* ihdr, * first, * plte, * trns;
 	int bit_depth, color_type, bpp, w, h, pix_bytes;
 	int compression, filter, interlace;
 	int datalen, offset;
@@ -1357,6 +1538,7 @@ cp_indexed_image_t cp_load_indexed_png_mem(const void *png_data, int png_length)
 	png.p = (uint8_t*)png_data;
 	png.end = (uint8_t*)png_data + png_length;
 
+	CUTE_PNG_CHECK(png.end - png.p >= 8, "file too short for PNG signature");
 	CUTE_PNG_CHECK(!CUTE_PNG_MEMCMP(png.p, sig, 8), "incorrect file signature (is this a png file?)");
 	png.p += 8;
 
@@ -1371,7 +1553,9 @@ cp_indexed_image_t cp_load_indexed_png_mem(const void *png_data, int png_length)
 	// +1 for filter byte (which is dumb! just stick this at file header...)
 	w = cp_make32(ihdr) + 1;
 	h = cp_make32(ihdr + 4);
-        CUTE_PNG_CHECK((int64_t) w * h * sizeof(uint8_t) < INT_MAX, "image too large");
+	CUTE_PNG_CHECK(w <= CUTE_PNG_MAX_WIDTH, "image too wide");
+	CUTE_PNG_CHECK(h <= CUTE_PNG_MAX_HEIGHT, "image too tall");
+	CUTE_PNG_CHECK((int64_t)w * h * sizeof(uint8_t) < INT_MAX, "image too large");
 	pix_bytes = w * h * sizeof(uint8_t);
 	img.w = w - 1;
 	img.h = h;
@@ -1407,6 +1591,7 @@ cp_indexed_image_t cp_load_indexed_png_mem(const void *png_data, int png_length)
 	// Copy in IDAT chunk data sections to form the compressed DEFLATE stream
 	png.p = first;
 	data = (uint8_t*)CUTE_PNG_ALLOC(datalen);
+	CUTE_PNG_CHECK(data, "out of memory");
 	offset = 0;
 	for (const uint8_t* idat = cp_find(&png, "IDAT", 0); idat; idat = cp_chunk(&png, "IDAT", 0))
 	{
@@ -1520,14 +1705,14 @@ typedef struct cp_atlas_node_t
 static cp_atlas_node_t* cp_best_fit(int sp, const cp_image_t* png, cp_atlas_node_t* nodes)
 {
 	int bestVolume = INT_MAX;
-	cp_atlas_node_t *best_node = 0;
+	cp_atlas_node_t* best_node = 0;
 	int width = png->w;
 	int height = png->h;
 	int png_volume = width * height;
 
 	for (int i = 0; i < sp; ++i)
 	{
-		cp_atlas_node_t *node = nodes + i;
+		cp_atlas_node_t* node = nodes + i;
 		int can_contain = node->size.x >= width && node->size.y >= height;
 		if (can_contain)
 		{
@@ -1558,7 +1743,7 @@ void cp_premultiply(cp_image_t* img)
 	int stride = w * sizeof(cp_pixel_t);
 	uint8_t* data = (uint8_t*)img->pix;
 
-	for(int i = 0; i < (int)stride * h; i += sizeof(cp_pixel_t))
+	for (int i = 0; i < (int)stride * h; i += sizeof(cp_pixel_t))
 	{
 		float a = (float)data[i + 3] / 255.0f;
 		float r = (float)data[i + 0] / 255.0f;
@@ -1599,8 +1784,8 @@ static void cp_qsort(cp_integer_image_t* items, int count)
 static void cp_write_pixel(char* mem, long color) {
 	mem[0] = (color >> 24) & 0xFF;
 	mem[1] = (color >> 16) & 0xFF;
-	mem[2] = (color >>  8) & 0xFF;
-	mem[3] = (color >>  0) & 0xFF;
+	mem[2] = (color >> 8) & 0xFF;
+	mem[3] = (color >> 0) & 0xFF;
 }
 
 cp_image_t cp_make_atlas(int atlas_width, int atlas_height, const cp_image_t* pngs, int png_count, cp_atlas_image_t* imgs_out)
@@ -1654,9 +1839,9 @@ cp_image_t cp_make_atlas(int atlas_width, int atlas_height, const cp_image_t* pn
 		const cp_image_t* png = pngs + image->img_index;
 		int width = png->w;
 		int height = png->h;
-		cp_atlas_node_t *best_fit = cp_best_fit(sp, png, nodes);
+		cp_atlas_node_t* best_fit = cp_best_fit(sp, png, nodes);
 		if (CUTE_PNG_ATLAS_MUST_FIT) CUTE_PNG_CHECK(best_fit, "Not enough room to place image in atlas.");
-		else if (!best_fit) 
+		else if (!best_fit)
 		{
 			image->fit = 0;
 			continue;
@@ -1725,8 +1910,8 @@ cp_image_t cp_make_atlas(int atlas_width, int atlas_height, const cp_image_t* pn
 	atlas_image_size = atlas_width * atlas_height * sizeof(cp_pixel_t);
 	atlas_pixels = CUTE_PNG_ALLOC(atlas_image_size);
 	CUTE_PNG_CHECK(atlas_pixels, "out of mem");
-	
-	for(int i = 0; i < atlas_image_size; i += sizeof(cp_pixel_t)) {
+
+	for (int i = 0; i < atlas_image_size; i += sizeof(cp_pixel_t)) {
 		cp_write_pixel((char*)atlas_pixels + i, CUTE_PNG_ATLAS_EMPTY_COLOR);
 	}
 
@@ -1856,29 +2041,29 @@ cp_err:
 	including commercial applications, and to alter it and redistribute it
 	freely, subject to the following restrictions:
 	  1. The origin of this software must not be misrepresented; you must not
-	     claim that you wrote the original software. If you use this software
-	     in a product, an acknowledgment in the product documentation would be
-	     appreciated but is not required.
+		 claim that you wrote the original software. If you use this software
+		 in a product, an acknowledgment in the product documentation would be
+		 appreciated but is not required.
 	  2. Altered source versions must be plainly marked as such, and must not
-	     be misrepresented as being the original software.
+		 be misrepresented as being the original software.
 	  3. This notice may not be removed or altered from any source distribution.
 	------------------------------------------------------------------------------
 	ALTERNATIVE B - Public Domain (www.unlicense.org)
 	This is free and unencumbered software released into the public domain.
-	Anyone is free to copy, modify, publish, use, compile, sell, or distribute this 
-	software, either in source code form or as a compiled binary, for any purpose, 
+	Anyone is free to copy, modify, publish, use, compile, sell, or distribute this
+	software, either in source code form or as a compiled binary, for any purpose,
 	commercial or non-commercial, and by any means.
-	In jurisdictions that recognize copyright laws, the author or authors of this 
-	software dedicate any and all copyright interest in the software to the public 
-	domain. We make this dedication for the benefit of the public at large and to 
-	the detriment of our heirs and successors. We intend this dedication to be an 
-	overt act of relinquishment in perpetuity of all present and future rights to 
+	In jurisdictions that recognize copyright laws, the author or authors of this
+	software dedicate any and all copyright interest in the software to the public
+	domain. We make this dedication for the benefit of the public at large and to
+	the detriment of our heirs and successors. We intend this dedication to be an
+	overt act of relinquishment in perpetuity of all present and future rights to
 	this software under copyright law.
-	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
-	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
-	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
-	AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN 
-	ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION 
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+	ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 	WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 	------------------------------------------------------------------------------
 */
